@@ -21,9 +21,13 @@
 
 import express from "express";
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+
+const execFileAsync = promisify(execFile);
 
 const KICK_CLIENT_ID = process.env.KICK_CLIENT_ID;
 const KICK_CLIENT_SECRET = process.env.KICK_CLIENT_SECRET;
@@ -83,30 +87,59 @@ async function kickOfficialFetch(path) {
 
 // ---------------------------------------------------------------------------
 // Unofficial: recent videos. Best-effort — see the warning at the top of this
-// file. A plain browser User-Agent is set because Kick's edge (Cloudflare)
-// sometimes blocks obvious bot/script traffic; this is NOT a full bypass, so
-// if this starts failing with 403s, that's expected and you're not missing a
-// config step, Kick's edge has just tightened up.
+// file. This shells out to curl (present on Render's standard Node image)
+// rather than using fetch(), because curl's TLS/HTTP fingerprint is less
+// likely to get flagged by Kick's Cloudflare bot protection than Node's
+// built-in client is — the same trick community Kick libraries use. This is
+// still not a guaranteed bypass; if it starts failing again, that's Kick's
+// edge tightening further, not a bug in your setup — the Apify "Kick
+// Scraper" or "Kick All-in-One API" actors are maintained alternatives worth
+// connecting as a fallback, since keeping up with anti-bot changes is their
+// whole job, not a side effect of ours.
 // ---------------------------------------------------------------------------
 
 async function kickUnofficialListVideos(slug, limit = 10) {
-  const res = await fetch(`https://kick.com/api/v2/channels/${slug}/videos`, {
-    headers: {
-      "User-Agent":
+  const url = `https://kick.com/api/v2/channels/${slug}/videos`;
+  let stdout;
+  try {
+    const result = await execFileAsync(
+      "curl",
+      [
+        "-sL",
+        "--max-time",
+        "15",
+        "-A",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-      Accept: "application/json",
-    },
-  });
-
-  if (!res.ok) {
+        "-H",
+        "Accept: application/json",
+        url,
+      ],
+      { timeout: 20_000, maxBuffer: 10 * 1024 * 1024 }
+    );
+    stdout = result.stdout;
+  } catch (err) {
     throw new Error(
-      `Unofficial videos endpoint returned ${res.status}. This endpoint is ` +
-        `undocumented and known to be fragile — if it's newly broken, try the ` +
-        `Apify "Kick Clip Downloader" or "Kick Scraper" actors as a fallback.`
+      `curl request to the unofficial videos endpoint failed: ${err.message}. ` +
+        `If curl isn't installed in this environment, that's the real cause — ` +
+        `switching to a maintained Apify scraper (Kick Scraper / Kick All-in-One ` +
+        `API) is the more durable fix at that point.`
     );
   }
 
-  const data = await res.json();
+  let data;
+  try {
+    data = JSON.parse(stdout);
+  } catch {
+    throw new Error(
+      "The unofficial videos endpoint didn't return JSON (likely a Cloudflare " +
+        "challenge page instead of data) — Kick's bot protection is still " +
+        "blocking this request even via curl. Treat this tool as blocked for " +
+        "now and use the Apify \"Kick Scraper\" or \"Kick All-in-One API\" " +
+        "actors instead, which are maintained specifically to keep up with " +
+        "this."
+    );
+  }
+
   const videos = Array.isArray(data) ? data : data.videos || data.data || [];
 
   return videos.slice(0, limit).map((v) => ({
