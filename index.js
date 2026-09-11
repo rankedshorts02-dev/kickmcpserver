@@ -121,52 +121,64 @@ async function kickUnofficialListVideos(slug, limit = 10) {
 
 // ---------------------------------------------------------------------------
 // MCP server + tools
+//
+// IMPORTANT: the SDK only allows one active transport per McpServer instance
+// — calling server.connect() a second time on the same instance throws
+// "Already connected to a transport". Since Streamable HTTP can have multiple
+// concurrent client sessions (Claude may reconnect, retry, etc.), each
+// session needs its OWN McpServer instance. So tool registration lives in a
+// factory function, called fresh per session below, instead of one shared
+// top-level `server`.
 // ---------------------------------------------------------------------------
 
-const server = new McpServer({ name: "kick-mcp", version: "0.1.0" });
+function createMcpServer() {
+  const server = new McpServer({ name: "kick-mcp", version: "0.1.0" });
 
-server.registerTool(
-  "get_channel_info",
-  {
-    title: "Get Kick channel info",
-    description:
-      "Look up a Kick.com channel by slug (the name in the URL, e.g. 'xqc'). " +
-      "Returns live status, category, and basic channel details via Kick's official API.",
-    inputSchema: {
-      slug: z.string().describe("Kick channel slug, e.g. 'xqc' from kick.com/xqc"),
+  server.registerTool(
+    "get_channel_info",
+    {
+      title: "Get Kick channel info",
+      description:
+        "Look up a Kick.com channel by slug (the name in the URL, e.g. 'xqc'). " +
+        "Returns live status, category, and basic channel details via Kick's official API.",
+      inputSchema: {
+        slug: z.string().describe("Kick channel slug, e.g. 'xqc' from kick.com/xqc"),
+      },
     },
-  },
-  async ({ slug }) => {
-    const data = await kickOfficialFetch(`/channels?slug=${encodeURIComponent(slug)}`);
-    const channel = data?.data?.[0] ?? null;
-    if (!channel) {
-      return {
-        content: [{ type: "text", text: `No channel found for slug "${slug}".` }],
-      };
+    async ({ slug }) => {
+      const data = await kickOfficialFetch(`/channels?slug=${encodeURIComponent(slug)}`);
+      const channel = data?.data?.[0] ?? null;
+      if (!channel) {
+        return {
+          content: [{ type: "text", text: `No channel found for slug "${slug}".` }],
+        };
+      }
+      return { content: [{ type: "text", text: JSON.stringify(channel, null, 2) }] };
     }
-    return { content: [{ type: "text", text: JSON.stringify(channel, null, 2) }] };
-  }
-);
+  );
 
-server.registerTool(
-  "list_recent_videos",
-  {
-    title: "List recent Kick VODs (best-effort)",
-    description:
-      "Lists a channel's most recent past broadcasts (VODs). Uses Kick's " +
-      "undocumented internal endpoint since there is no official video-listing " +
-      "API — treat results as best-effort and expect this to occasionally need " +
-      "maintenance if Kick changes their site.",
-    inputSchema: {
-      slug: z.string().describe("Kick channel slug, e.g. 'xqc'"),
-      limit: z.number().int().min(1).max(25).default(10).describe("Max videos to return"),
+  server.registerTool(
+    "list_recent_videos",
+    {
+      title: "List recent Kick VODs (best-effort)",
+      description:
+        "Lists a channel's most recent past broadcasts (VODs). Uses Kick's " +
+        "undocumented internal endpoint since there is no official video-listing " +
+        "API — treat results as best-effort and expect this to occasionally need " +
+        "maintenance if Kick changes their site.",
+      inputSchema: {
+        slug: z.string().describe("Kick channel slug, e.g. 'xqc'"),
+        limit: z.number().int().min(1).max(25).default(10).describe("Max videos to return"),
+      },
     },
-  },
-  async ({ slug, limit }) => {
-    const videos = await kickUnofficialListVideos(slug, limit);
-    return { content: [{ type: "text", text: JSON.stringify(videos, null, 2) }] };
-  }
-);
+    async ({ slug, limit }) => {
+      const videos = await kickUnofficialListVideos(slug, limit);
+      return { content: [{ type: "text", text: JSON.stringify(videos, null, 2) }] };
+    }
+  );
+
+  return server;
+}
 
 // ---------------------------------------------------------------------------
 // Streamable HTTP transport (what lets this be added as a Claude custom
@@ -192,6 +204,7 @@ app.post("/mcp", async (req, res) => {
     transport.onclose = () => {
       if (transport.sessionId) delete transports[transport.sessionId];
     };
+    const server = createMcpServer();
     await server.connect(transport);
   }
 
