@@ -151,15 +151,22 @@ async function kickUnofficialListVideos(slug, limit = 10) {
 
   const videos = Array.isArray(data) ? data : data.videos || data.data || [];
   console.log(`[list_recent_videos] parsed ${videos.length} video entries`);
-  if (videos[0]) {
-    console.log(`[list_recent_videos] sample raw fields: ${Object.keys(videos[0]).join(", ")}`);
-  }
 
-  // Returning Kick's raw fields as-is rather than remapping them: an earlier
-  // version guessed at field names/units (e.g. assumed a duration field was
-  // in seconds when it's actually milliseconds) and got it wrong. Better to
-  // show the real data than a confidently-mislabeled version of it.
-  return videos.slice(0, limit);
+  // Confirmed field names from a real response (Kick's fields, not documented
+  // anywhere, so worth naming explicitly): `duration` is in MILLISECONDS,
+  // and the real video identifier is nested at `video.uuid` — a top-level
+  // `slug` also exists but is a separate SEO-style string, not the page URL.
+  // `source` is a direct HLS stream manifest URL for the finished VOD, which
+  // may be more directly usable by a clipping tool than the page URL is.
+  return videos.slice(0, limit).map((v) => ({
+    id: v.id ?? null,
+    title: v.session_title ?? null,
+    startedAt: v.created_at ?? null,
+    durationSeconds: typeof v.duration === "number" ? Math.round(v.duration / 1000) : null,
+    viewCount: v.views ?? v.viewer_count ?? null,
+    pageUrl: v.video?.uuid ? `https://kick.com/${slug}/videos/${v.video.uuid}` : null,
+    hlsStreamUrl: v.source ?? null,
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -205,10 +212,10 @@ function createMcpServer() {
     {
       title: "List recent Kick VODs (best-effort)",
       description:
-        "Lists a channel's most recent past broadcasts (VODs). Uses Kick's " +
-        "undocumented internal endpoint since there is no official video-listing " +
-        "API — treat results as best-effort and expect this to occasionally need " +
-        "maintenance if Kick changes their site.",
+        "Lists a channel's most recent past broadcasts (VODs), with a page URL and a " +
+        "direct HLS stream URL for each. Uses Kick's undocumented internal endpoint " +
+        "since there is no official video-listing API — treat results as best-effort " +
+        "and expect this to occasionally need maintenance if Kick changes their site.",
       inputSchema: {
         slug: z.string().describe("Kick channel slug, e.g. 'xqc'"),
         limit: z.number().int().min(1).max(25).default(10).describe("Max videos to return"),
