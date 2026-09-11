@@ -151,15 +151,15 @@ async function kickUnofficialListVideos(slug, limit = 10) {
 
   const videos = Array.isArray(data) ? data : data.videos || data.data || [];
   console.log(`[list_recent_videos] parsed ${videos.length} video entries`);
+  if (videos[0]) {
+    console.log(`[list_recent_videos] sample raw fields: ${Object.keys(videos[0]).join(", ")}`);
+  }
 
-  return videos.slice(0, limit).map((v) => ({
-    id: v.id ?? v.uuid ?? null,
-    title: v.session_title ?? v.title ?? null,
-    startedAt: v.started_at ?? v.created_at ?? null,
-    durationSeconds: v.duration_seconds ?? v.duration ?? null,
-    viewCount: v.view_count ?? v.views ?? null,
-    url: v.url ?? (v.uuid ? `https://kick.com/${slug}/videos/${v.uuid}` : null),
-  }));
+  // Returning Kick's raw fields as-is rather than remapping them: an earlier
+  // version guessed at field names/units (e.g. assumed a duration field was
+  // in seconds when it's actually milliseconds) and got it wrong. Better to
+  // show the real data than a confidently-mislabeled version of it.
+  return videos.slice(0, limit);
 }
 
 // ---------------------------------------------------------------------------
