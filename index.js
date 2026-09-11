@@ -100,6 +100,8 @@ async function kickOfficialFetch(path) {
 
 async function kickUnofficialListVideos(slug, limit = 10) {
   const url = `https://kick.com/api/v2/channels/${slug}/videos`;
+  console.log(`[list_recent_videos] fetching ${url} via curl...`);
+
   let stdout;
   try {
     const result = await execFileAsync(
@@ -117,7 +119,11 @@ async function kickUnofficialListVideos(slug, limit = 10) {
       { timeout: 20_000, maxBuffer: 10 * 1024 * 1024 }
     );
     stdout = result.stdout;
+    console.log(
+      `[list_recent_videos] curl succeeded, ${stdout.length} bytes returned. First 200 chars: ${stdout.slice(0, 200)}`
+    );
   } catch (err) {
+    console.error(`[list_recent_videos] curl execution failed:`, err);
     throw new Error(
       `curl request to the unofficial videos endpoint failed: ${err.message}. ` +
         `If curl isn't installed in this environment, that's the real cause — ` +
@@ -129,7 +135,10 @@ async function kickUnofficialListVideos(slug, limit = 10) {
   let data;
   try {
     data = JSON.parse(stdout);
-  } catch {
+  } catch (parseErr) {
+    console.error(
+      `[list_recent_videos] response was not valid JSON. Parse error: ${parseErr.message}. Raw response (first 500 chars): ${stdout.slice(0, 500)}`
+    );
     throw new Error(
       "The unofficial videos endpoint didn't return JSON (likely a Cloudflare " +
         "challenge page instead of data) — Kick's bot protection is still " +
@@ -141,6 +150,7 @@ async function kickUnofficialListVideos(slug, limit = 10) {
   }
 
   const videos = Array.isArray(data) ? data : data.videos || data.data || [];
+  console.log(`[list_recent_videos] parsed ${videos.length} video entries`);
 
   return videos.slice(0, limit).map((v) => ({
     id: v.id ?? v.uuid ?? null,
@@ -224,6 +234,7 @@ app.use(express.json());
 const transports = {};
 
 app.post("/mcp", async (req, res) => {
+  console.log(`[mcp] incoming request, session header: ${req.headers["mcp-session-id"] || "(none)"}`);
   const sessionId = req.headers["mcp-session-id"];
   let transport = sessionId ? transports[sessionId] : undefined;
 
