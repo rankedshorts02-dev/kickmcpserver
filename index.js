@@ -202,9 +202,10 @@ async function cacheVideoFromUrl(sourceUrl, filename) {
   // Keep filenames safe and predictable — strip anything that isn't
   // alphanumeric, dot, dash, or underscore.
   const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const rawPath = path.join(VIDEOS_DIR, `raw-${safeName}`);
   const destPath = path.join(VIDEOS_DIR, safeName);
 
-  console.log(`[cache_video] fetching ${sourceUrl} -> ${destPath}`);
+  console.log(`[cache_video] fetching ${sourceUrl} -> ${rawPath}`);
   const res = await fetch(sourceUrl);
   if (!res.ok || !res.body) {
     throw new Error(`Failed to fetch source video: HTTP ${res.status}`);
@@ -213,11 +214,44 @@ async function cacheVideoFromUrl(sourceUrl, filename) {
   // Stream straight to disk rather than buffering in memory — this file
   // can be hundreds of MB to multiple GB, and the instance only has 512MB
   // of RAM on the free tier.
-  await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(destPath));
+  await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(rawPath));
+  const rawStats = fs.statSync(rawPath);
+  console.log(`[cache_video] raw download complete, ${rawStats.size} bytes`);
+
+  // Videos remuxed from live HLS (which is what this download effectively
+  // is) commonly end up with their metadata ("moov atom") at the END of the
+  // file rather than the start. Tools that read metadata via a small range
+  // request near the beginning — which is what both OpusClip and Descript's
+  // errors pointed to — can't find it there and report the file as
+  // unreadable/corrupt even though it's structurally valid. `-movflags
+  // faststart` does a fast, lossless remux (no re-encoding) that moves the
+  // moov atom to the front. If ffmpeg isn't available on this image, this
+  // will throw clearly rather than silently, which itself is useful
+  // information — it would mean this fix needs a different environment.
+  console.log(`[cache_video] running ffmpeg faststart remux...`);
+  try {
+    await execFileAsync("ffmpeg", [
+      "-y",
+      "-i", rawPath,
+      "-c", "copy",
+      "-movflags", "+faststart",
+      destPath,
+    ], { timeout: 120_000, maxBuffer: 10 * 1024 * 1024 });
+  } catch (err) {
+    console.error(`[cache_video] ffmpeg faststart remux failed:`, err);
+    throw new Error(
+      `Download succeeded but the faststart remux failed: ${err.message}. ` +
+        `If ffmpeg isn't installed on this image, that's the real cause — ` +
+        `serving the raw file without this fix is unlikely to work with ` +
+        `tools that need to read metadata via range requests.`
+    );
+  } finally {
+    fs.unlink(rawPath, () => {});
+  }
 
   const stats = fs.statSync(destPath);
   const publicUrl = `${PUBLIC_BASE_URL}/videos/${safeName}`;
-  console.log(`[cache_video] done, ${stats.size} bytes written, serving at ${publicUrl}`);
+  console.log(`[cache_video] done, ${stats.size} bytes written after remux, serving at ${publicUrl}`);
 
   return { publicUrl, bytesWritten: stats.size };
 }
@@ -285,12 +319,14 @@ function createMcpServer() {
     {
       title: "Cache a remote video for tools that need range-request support",
       description:
-        "Downloads a video from any URL (e.g. an Apify-hosted file) onto this " +
-        "server and re-serves it with proper HTTP range-request support, which " +
-        "clipping tools like OpusClip and Descript require but Apify's file " +
-        "hosting doesn't provide. Returns a new URL to feed into those tools " +
-        "instead of the original one. Note: the cached file is temporary and " +
-        "does not survive a server restart/redeploy.",
+        "Downloads a video from any URL (e.g. an Apify-hosted file), remuxes it " +
+        "with ffmpeg -movflags faststart (fixes metadata placement for videos " +
+        "remuxed from live HLS, without re-encoding), and re-serves it with " +
+        "proper HTTP range-request support — both of which OpusClip and " +
+        "Descript need but Apify's file hosting/raw remux don't provide. " +
+        "Returns a new URL to feed into those tools instead of the original " +
+        "one. Note: the cached file is temporary and does not survive a " +
+        "server restart/redeploy.",
       inputSchema: {
         sourceUrl: z.string().describe("URL of the video to download and re-host"),
         filename: z.string().describe("Filename to save it as, e.g. 'n3on-vod-1.mp4'"),
