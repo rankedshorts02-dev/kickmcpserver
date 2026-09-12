@@ -24,10 +24,28 @@ import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { z } from "zod";
+import fs from "node:fs";
+import path from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 const execFileAsync = promisify(execFile);
+
+// Where downloaded videos are cached before being re-served. This is plain
+// local disk on the Render instance — it does NOT persist across restarts
+// or redeploys, and free-tier disk space is limited, so this is meant for
+// short-lived relay (download, hand the URL to a clipping tool, done), not
+// long-term storage. Use low/medium quality downloads to stay well within
+// free-tier limits.
+const VIDEOS_DIR = path.join(process.cwd(), "cached-videos");
+fs.mkdirSync(VIDEOS_DIR, { recursive: true });
+
+// The public base URL other services (OpusClip, Descript) will use to fetch
+// cached files back from this server. Defaults to this deployment's known
+// Render URL; override with PUBLIC_BASE_URL if the service is ever renamed.
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://kickmcpserver.onrender.com";
 
 const KICK_CLIENT_ID = process.env.KICK_CLIENT_ID;
 const KICK_CLIENT_SECRET = process.env.KICK_CLIENT_SECRET;
@@ -170,6 +188,41 @@ async function kickUnofficialListVideos(slug, limit = 10) {
 }
 
 // ---------------------------------------------------------------------------
+// Cache-and-reserve: downloads a video from any URL (e.g. an Apify-hosted
+// file) onto this server's local disk, then serves it back out through
+// Express's static file handler, which supports HTTP range requests
+// correctly by default. This exists because both OpusClip and Descript
+// require range-request support to read a remote video, and Apify's
+// key-value-store file hosting doesn't provide that — so the fix is to
+// re-host the file somewhere that does, rather than anything about Kick
+// or the video format itself.
+// ---------------------------------------------------------------------------
+
+async function cacheVideoFromUrl(sourceUrl, filename) {
+  // Keep filenames safe and predictable — strip anything that isn't
+  // alphanumeric, dot, dash, or underscore.
+  const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const destPath = path.join(VIDEOS_DIR, safeName);
+
+  console.log(`[cache_video] fetching ${sourceUrl} -> ${destPath}`);
+  const res = await fetch(sourceUrl);
+  if (!res.ok || !res.body) {
+    throw new Error(`Failed to fetch source video: HTTP ${res.status}`);
+  }
+
+  // Stream straight to disk rather than buffering in memory — this file
+  // can be hundreds of MB to multiple GB, and the instance only has 512MB
+  // of RAM on the free tier.
+  await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(destPath));
+
+  const stats = fs.statSync(destPath);
+  const publicUrl = `${PUBLIC_BASE_URL}/videos/${safeName}`;
+  console.log(`[cache_video] done, ${stats.size} bytes written, serving at ${publicUrl}`);
+
+  return { publicUrl, bytesWritten: stats.size };
+}
+
+// ---------------------------------------------------------------------------
 // MCP server + tools
 //
 // IMPORTANT: the SDK only allows one active transport per McpServer instance
@@ -227,6 +280,28 @@ function createMcpServer() {
     }
   );
 
+  server.registerTool(
+    "cache_video_for_processing",
+    {
+      title: "Cache a remote video for tools that need range-request support",
+      description:
+        "Downloads a video from any URL (e.g. an Apify-hosted file) onto this " +
+        "server and re-serves it with proper HTTP range-request support, which " +
+        "clipping tools like OpusClip and Descript require but Apify's file " +
+        "hosting doesn't provide. Returns a new URL to feed into those tools " +
+        "instead of the original one. Note: the cached file is temporary and " +
+        "does not survive a server restart/redeploy.",
+      inputSchema: {
+        sourceUrl: z.string().describe("URL of the video to download and re-host"),
+        filename: z.string().describe("Filename to save it as, e.g. 'n3on-vod-1.mp4'"),
+      },
+    },
+    async ({ sourceUrl, filename }) => {
+      const result = await cacheVideoFromUrl(sourceUrl, filename);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
   return server;
 }
 
@@ -281,6 +356,10 @@ app.post("/mcp", async (req, res) => {
 
   await transport.handleRequest(req, res, req.body);
 });
+
+// Serves cached videos with correct HTTP range-request support out of the
+// box — this is the whole point of the cache_video_for_processing tool above.
+app.use("/videos", express.static(VIDEOS_DIR));
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
