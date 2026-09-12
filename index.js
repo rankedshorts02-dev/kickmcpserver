@@ -198,7 +198,52 @@ async function kickUnofficialListVideos(slug, limit = 10) {
 // or the video format itself.
 // ---------------------------------------------------------------------------
 
-async function cacheVideoFromUrl(sourceUrl, filename) {
+async function extractSegmentFromUrl(sourceUrl, filename, startOffsetSec, durationSec) {
+  const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const destPath = path.join(VIDEOS_DIR, safeName);
+
+  // Lets ffmpeg fetch directly from the source (HLS or a flat file) rather
+  // than downloading the whole thing through Node first — for a multi-hour
+  // source, this pulls only the segments needed for the requested window
+  // instead of the entire file. -ss BEFORE -i is fast/input-side seeking.
+  // -c copy avoids re-encoding (fast, no quality loss); if that ever
+  // produces a broken cut at the boundary, re-encoding is the fallback but
+  // isn't attempted automatically here.
+  console.log(
+    `[extract_segment] ffmpeg pulling ${sourceUrl} from ${startOffsetSec}s for ${durationSec}s -> ${destPath}`
+  );
+  try {
+    await execFileAsync(
+      "ffmpeg",
+      [
+        "-y",
+        "-ss", String(startOffsetSec),
+        "-i", sourceUrl,
+        "-t", String(durationSec),
+        "-c", "copy",
+        "-movflags", "+faststart",
+        destPath,
+      ],
+      { timeout: 600_000, maxBuffer: 10 * 1024 * 1024 }
+    );
+  } catch (err) {
+    console.error(`[extract_segment] ffmpeg failed:`, err);
+    throw new Error(
+      `ffmpeg couldn't extract this segment: ${err.message}. If the source ` +
+        `is an HLS URL, it may need re-encoding instead of stream copy for ` +
+        `a clean cut at this boundary, or the source URL itself may no ` +
+        `longer be reachable.`
+    );
+  }
+
+  const stats = fs.statSync(destPath);
+  const publicUrl = `${PUBLIC_BASE_URL}/videos/${safeName}`;
+  console.log(`[extract_segment] done, ${stats.size} bytes written, serving at ${publicUrl}`);
+
+  return { publicUrl, bytesWritten: stats.size };
+}
+
+async function cacheVideoFromUrl(sourceUrl, filename, maxDurationSec) {
   // Keep filenames safe and predictable — strip anything that isn't
   // alphanumeric, dot, dash, or underscore.
   const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
@@ -228,15 +273,23 @@ async function cacheVideoFromUrl(sourceUrl, filename) {
   // moov atom to the front. If ffmpeg isn't available on this image, this
   // will throw clearly rather than silently, which itself is useful
   // information — it would mean this fix needs a different environment.
-  console.log(`[cache_video] running ffmpeg faststart remux...`);
+  //
+  // maxDurationSec (optional) trims the output to that length using the
+  // same ffmpeg pass — added because some downstream tools (OpusClip on a
+  // trial plan) reject a source video based on its FULL original length
+  // even when a processing range is requested separately, so the only
+  // reliable fix is to hand over a genuinely shorter file.
+  console.log(
+    `[cache_video] running ffmpeg faststart remux${maxDurationSec ? ` (trimmed to ${maxDurationSec}s)` : ""}...`
+  );
+  const ffmpegArgs = ["-y", "-i", rawPath];
+  if (maxDurationSec) {
+    ffmpegArgs.push("-t", String(maxDurationSec));
+  }
+  ffmpegArgs.push("-c", "copy", "-movflags", "+faststart", destPath);
+
   try {
-    await execFileAsync("ffmpeg", [
-      "-y",
-      "-i", rawPath,
-      "-c", "copy",
-      "-movflags", "+faststart",
-      destPath,
-    ], { timeout: 120_000, maxBuffer: 10 * 1024 * 1024 });
+    await execFileAsync("ffmpeg", ffmpegArgs, { timeout: 180_000, maxBuffer: 10 * 1024 * 1024 });
   } catch (err) {
     console.error(`[cache_video] ffmpeg faststart remux failed:`, err);
     throw new Error(
@@ -324,16 +377,51 @@ function createMcpServer() {
         "remuxed from live HLS, without re-encoding), and re-serves it with " +
         "proper HTTP range-request support — both of which OpusClip and " +
         "Descript need but Apify's file hosting/raw remux don't provide. " +
-        "Returns a new URL to feed into those tools instead of the original " +
-        "one. Note: the cached file is temporary and does not survive a " +
-        "server restart/redeploy.",
+        "Optionally trims to maxDurationSec in the same pass — useful when a " +
+        "downstream tool rejects a video based on its full original length " +
+        "even when a separate processing range was requested (seen with " +
+        "OpusClip on long source videos). Returns a new URL to feed into " +
+        "those tools instead of the original one. Note: the cached file is " +
+        "temporary and does not survive a server restart/redeploy.",
       inputSchema: {
         sourceUrl: z.string().describe("URL of the video to download and re-host"),
         filename: z.string().describe("Filename to save it as, e.g. 'n3on-vod-1.mp4'"),
+        maxDurationSec: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe("Optional: trim the output to this many seconds from the start"),
       },
     },
-    async ({ sourceUrl, filename }) => {
-      const result = await cacheVideoFromUrl(sourceUrl, filename);
+    async ({ sourceUrl, filename, maxDurationSec }) => {
+      const result = await cacheVideoFromUrl(sourceUrl, filename, maxDurationSec);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "extract_video_segment",
+    {
+      title: "Extract a time-bounded segment directly from a video URL",
+      description:
+        "Pulls a specific time window (startOffsetSec to startOffsetSec+durationSec) " +
+        "directly from a source URL — such as Kick's own HLS stream URL from " +
+        "list_recent_videos — via ffmpeg, without downloading the entire source " +
+        "first. Built for splitting a multi-hour VOD into chunks (e.g. for " +
+        "submitting each chunk to OpusClip separately) without storing the " +
+        "full file on disk. Output is faststart-remuxed and range-request " +
+        "servable, same as cache_video_for_processing. Note: served files are " +
+        "temporary and do not survive a server restart/redeploy.",
+      inputSchema: {
+        sourceUrl: z.string().describe("Source video URL, e.g. an HLS master.m3u8 URL"),
+        filename: z.string().describe("Filename to save the segment as, e.g. 'stream-chunk-1.mp4'"),
+        startOffsetSec: z.number().nonnegative().describe("Start offset in seconds from the beginning of the source"),
+        durationSec: z.number().positive().describe("How many seconds to extract from that offset"),
+      },
+    },
+    async ({ sourceUrl, filename, startOffsetSec, durationSec }) => {
+      const result = await extractSegmentFromUrl(sourceUrl, filename, startOffsetSec, durationSec);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
   );
