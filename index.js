@@ -221,6 +221,8 @@ async function extractSegmentFromUrl(sourceUrl, filename, startOffsetSec, durati
         "-i", sourceUrl,
         "-t", String(durationSec),
         "-c", "copy",
+        "-fflags", "+genpts",
+        "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
         destPath,
       ],
