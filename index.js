@@ -220,13 +220,14 @@ async function extractSegmentFromUrl(sourceUrl, filename, startOffsetSec, durati
         "-ss", String(startOffsetSec),
         "-i", sourceUrl,
         "-t", String(durationSec),
-        "-c", "copy",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-c:a", "aac",
         "-fflags", "+genpts",
-        "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
         destPath,
       ],
-      { timeout: 600_000, maxBuffer: 10 * 1024 * 1024 }
+      { timeout: 590_000, maxBuffer: 10 * 1024 * 1024 }
     );
   } catch (err) {
     console.error(`[extract_segment] ffmpeg failed:`, err);
