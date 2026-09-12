@@ -198,6 +198,27 @@ async function kickUnofficialListVideos(slug, limit = 10) {
 // or the video format itself.
 // ---------------------------------------------------------------------------
 
+async function downloadRawVideo(sourceUrl, filename) {
+  const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const destPath = path.join(VIDEOS_DIR, `raw-${safeName}`);
+
+  console.log(`[download_raw] fetching ${sourceUrl} -> ${destPath}`);
+  const res = await fetch(sourceUrl);
+  if (!res.ok || !res.body) {
+    throw new Error(`Failed to fetch source video: HTTP ${res.status}`);
+  }
+
+  await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(destPath));
+  const stats = fs.statSync(destPath);
+  console.log(`[download_raw] done, ${stats.size} bytes written to ${destPath}`);
+
+  // Returns a local path, not a public URL — this file is meant to be
+  // chunked with extract_video_segment (which accepts a local path as its
+  // sourceUrl, since ffmpeg -i handles local files the same as remote
+  // ones), not served directly.
+  return { localPath: destPath, bytesWritten: stats.size };
+}
+
 async function extractSegmentFromUrl(sourceUrl, filename, startOffsetSec, durationSec) {
   const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
   const destPath = path.join(VIDEOS_DIR, safeName);
@@ -212,6 +233,15 @@ async function extractSegmentFromUrl(sourceUrl, filename, startOffsetSec, durati
   console.log(
     `[extract_segment] ffmpeg pulling ${sourceUrl} from ${startOffsetSec}s for ${durationSec}s -> ${destPath}`
   );
+  // NOTE: stream-copy, not re-encode. Re-encoding was tried as a fix for
+  // metadata issues when pulling directly from a *live* HLS manifest, but
+  // it pins this instance's very limited CPU hard enough to make the whole
+  // server unresponsive, even for a 3-minute test. The actual fix is
+  // upstream: only ever point this at an already-finalized file (e.g. one
+  // already downloaded via the Apify actor), never at Kick's raw live HLS
+  // URL directly. Copying from a well-formed file doesn't carry the same
+  // metadata corruption risk that copying from an in-progress live stream
+  // does, so plain copy should be reliable here.
   try {
     await execFileAsync(
       "ffmpeg",
@@ -220,10 +250,8 @@ async function extractSegmentFromUrl(sourceUrl, filename, startOffsetSec, durati
         "-ss", String(startOffsetSec),
         "-i", sourceUrl,
         "-t", String(durationSec),
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-c:a", "aac",
-        "-fflags", "+genpts",
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
         destPath,
       ],
@@ -425,6 +453,30 @@ function createMcpServer() {
     },
     async ({ sourceUrl, filename, startOffsetSec, durationSec }) => {
       const result = await extractSegmentFromUrl(sourceUrl, filename, startOffsetSec, durationSec);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "download_raw_video",
+    {
+      title: "Download and persist a raw video file locally",
+      description:
+        "Downloads a file (e.g. an Apify-hosted download URL) onto this server's " +
+        "disk and keeps it there (unlike cache_video_for_processing, which " +
+        "deletes the raw download after processing it). Returns a local file " +
+        "path, not a public URL — meant to be reused as the sourceUrl for " +
+        "multiple extract_video_segment calls (chunking a long video into " +
+        "several pieces) without re-downloading for each chunk. Note: the " +
+        "file is temporary and does not survive a server restart/redeploy, " +
+        "and counts toward this instance's limited free-tier disk space.",
+      inputSchema: {
+        sourceUrl: z.string().describe("URL of the file to download"),
+        filename: z.string().describe("Filename to save it as, e.g. 'trainwreck-full.mp4'"),
+      },
+    },
+    async ({ sourceUrl, filename }) => {
+      const result = await downloadRawVideo(sourceUrl, filename);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
   );
