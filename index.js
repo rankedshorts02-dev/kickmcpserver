@@ -215,14 +215,21 @@ function startBackgroundDownload(sourceUrl, filename) {
   // code, silently truncating large/long downloads with no thrown error.
   // Running it detached lets it continue as long as the Node process is
   // alive, independent of any one request.
+  // Deliberately NOT awaited. Originally this used Node's fetch()+pipeline,
+  // but that truncated large downloads at an identical byte count (~510MB)
+  // on repeated attempts regardless of whether it ran synchronously or in
+  // the background — ruling out a request-timeout theory and pointing to
+  // something in Node's fetch implementation itself with very large
+  // responses. curl is a mature, purpose-built tool for large file
+  // transfers and doesn't share that limitation.
   (async () => {
     try {
-      console.log(`[download_bg ${trackingId}] fetching ${sourceUrl} -> ${destPath}`);
-      const res = await fetch(sourceUrl);
-      if (!res.ok || !res.body) {
-        throw new Error(`Failed to fetch source video: HTTP ${res.status}`);
-      }
-      await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(destPath));
+      console.log(`[download_bg ${trackingId}] fetching via curl ${sourceUrl} -> ${destPath}`);
+      await execFileAsync(
+        "curl",
+        ["-sL", "--fail", "-o", destPath, sourceUrl],
+        { timeout: 0, maxBuffer: 10 * 1024 * 1024 }
+      );
       const stats = fs.statSync(destPath);
       downloadJobs[trackingId] = { status: "done", localPath: destPath, bytesWritten: stats.size, error: null };
       console.log(`[download_bg ${trackingId}] done, ${stats.size} bytes`);
