@@ -198,6 +198,57 @@ async function kickUnofficialListVideos(slug, limit = 10) {
 // or the video format itself.
 // ---------------------------------------------------------------------------
 
+// In-memory tracking for background downloads. Lost on restart, but that's
+// fine — a lost job just needs to be re-started.
+const downloadJobs = {};
+
+function startBackgroundDownload(sourceUrl, filename) {
+  const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const destPath = path.join(VIDEOS_DIR, `raw-${safeName}`);
+  const trackingId = randomUUID();
+  downloadJobs[trackingId] = { status: "running", localPath: destPath, error: null };
+
+  // Deliberately NOT awaited — this is the fix. Awaiting the full download
+  // inside a request handler ties it to that single incoming HTTP request's
+  // lifetime, and Render appears to kill the underlying connection after
+  // some platform-level time limit regardless of any timeout set in this
+  // code, silently truncating large/long downloads with no thrown error.
+  // Running it detached lets it continue as long as the Node process is
+  // alive, independent of any one request.
+  (async () => {
+    try {
+      console.log(`[download_bg ${trackingId}] fetching ${sourceUrl} -> ${destPath}`);
+      const res = await fetch(sourceUrl);
+      if (!res.ok || !res.body) {
+        throw new Error(`Failed to fetch source video: HTTP ${res.status}`);
+      }
+      await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(destPath));
+      const stats = fs.statSync(destPath);
+      downloadJobs[trackingId] = { status: "done", localPath: destPath, bytesWritten: stats.size, error: null };
+      console.log(`[download_bg ${trackingId}] done, ${stats.size} bytes`);
+    } catch (err) {
+      console.error(`[download_bg ${trackingId}] failed:`, err);
+      downloadJobs[trackingId] = { status: "error", localPath: destPath, error: err.message };
+    }
+  })();
+
+  return trackingId;
+}
+
+function getDownloadStatus(trackingId) {
+  const job = downloadJobs[trackingId];
+  if (!job) {
+    throw new Error(`Unknown trackingId "${trackingId}" — it may be from before a server restart.`);
+  }
+  let currentBytesOnDisk = 0;
+  try {
+    currentBytesOnDisk = fs.statSync(job.localPath).size;
+  } catch {
+    // file may not exist yet
+  }
+  return { ...job, currentBytesOnDisk };
+}
+
 async function downloadRawVideo(sourceUrl, filename) {
   const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
   const destPath = path.join(VIDEOS_DIR, `raw-${safeName}`);
@@ -464,12 +515,18 @@ function createMcpServer() {
       description:
         "Downloads a file (e.g. an Apify-hosted download URL) onto this server's " +
         "disk and keeps it there (unlike cache_video_for_processing, which " +
-        "deletes the raw download after processing it). Returns a local file " +
-        "path, not a public URL — meant to be reused as the sourceUrl for " +
-        "multiple extract_video_segment calls (chunking a long video into " +
-        "several pieces) without re-downloading for each chunk. Note: the " +
-        "file is temporary and does not survive a server restart/redeploy, " +
-        "and counts toward this instance's limited free-tier disk space.",
+        "deletes the raw download after processing it). WARNING: only safe for " +
+        "smaller/quick downloads — Render appears to enforce a per-request time " +
+        "limit that silently truncates larger downloads run this way, with no " +
+        "error thrown (confirmed: a 9-hour video came back as a truncated ~500MB " +
+        "file with no warning). For anything of meaningful size or a long " +
+        "stream, use start_background_download + check_download_status instead. " +
+        "Returns a local file path, not a public URL — meant to be reused as " +
+        "the sourceUrl for multiple extract_video_segment calls (chunking a " +
+        "long video into several pieces) without re-downloading for each " +
+        "chunk. Note: the file is temporary and does not survive a server " +
+        "restart/redeploy, and counts toward this instance's limited free-tier " +
+        "disk space.",
       inputSchema: {
         sourceUrl: z.string().describe("URL of the file to download"),
         filename: z.string().describe("Filename to save it as, e.g. 'trainwreck-full.mp4'"),
@@ -478,6 +535,60 @@ function createMcpServer() {
     async ({ sourceUrl, filename }) => {
       const result = await downloadRawVideo(sourceUrl, filename);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "start_background_download",
+    {
+      title: "Start a large download in the background",
+      description:
+        "Starts downloading a file (e.g. an Apify-hosted video) WITHOUT waiting " +
+        "for it to finish, and returns immediately with a trackingId. Use this " +
+        "instead of download_raw_video for anything large/long — Render appears " +
+        "to enforce a per-request time limit that silently truncates downloads " +
+        "run synchronously within a single request, with no error thrown. Poll " +
+        "check_download_status with the returned trackingId until status is " +
+        "'done', then use the localPath it reports as the sourceUrl for " +
+        "extract_video_segment.",
+      inputSchema: {
+        sourceUrl: z.string().describe("URL of the file to download"),
+        filename: z.string().describe("Filename to save it as, e.g. 'trainwreck-full.mp4'"),
+      },
+    },
+    async ({ sourceUrl, filename }) => {
+      const trackingId = startBackgroundDownload(sourceUrl, filename);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { trackingId, message: "Download started in the background. Poll check_download_status to see progress." },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
+
+  server.registerTool(
+    "check_download_status",
+    {
+      title: "Check on a background download",
+      description:
+        "Checks the status of a download started with start_background_download. " +
+        "Returns status ('running' | 'done' | 'error'), the current file size on " +
+        "disk (useful for gauging progress on a still-running download), and — " +
+        "once done — the localPath to use as extract_video_segment's sourceUrl.",
+      inputSchema: {
+        trackingId: z.string().describe("The trackingId returned by start_background_download"),
+      },
+    },
+    async ({ trackingId }) => {
+      const status = getDownloadStatus(trackingId);
+      return { content: [{ type: "text", text: JSON.stringify(status, null, 2) }] };
     }
   );
 
