@@ -606,6 +606,32 @@ function createMcpServer() {
     }
   );
 
+  server.registerTool(
+    "peek_file_contents",
+    {
+      title: "Peek at a cached file's raw content",
+      description:
+        "Reads the first N bytes of an already-downloaded file and returns them " +
+        "as text. Useful for diagnosing a download that came back suspiciously " +
+        "small — often this reveals it's actually an HTML error/redirect page " +
+        "rather than real binary content.",
+      inputSchema: {
+        filename: z.string().describe("Filename as saved in the videos directory, e.g. 'raw-goli-walmart-source-v2.mp4'"),
+        maxBytes: z.number().int().positive().default(2000).describe("How many bytes to read"),
+      },
+    },
+    async ({ filename, maxBytes }) => {
+      const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+      const filePath = path.join(VIDEOS_DIR, safeName);
+      const fd = fs.openSync(filePath, "r");
+      const buffer = Buffer.alloc(maxBytes);
+      const bytesRead = fs.readSync(fd, buffer, 0, maxBytes, 0);
+      fs.closeSync(fd);
+      const preview = buffer.subarray(0, bytesRead).toString("utf8");
+      return { content: [{ type: "text", text: preview }] };
+    }
+  );
+
   return server;
 }
 
