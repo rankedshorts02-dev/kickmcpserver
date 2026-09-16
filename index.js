@@ -227,7 +227,14 @@ function startBackgroundDownload(sourceUrl, filename) {
       console.log(`[download_bg ${trackingId}] fetching via curl ${sourceUrl} -> ${destPath}`);
       await execFileAsync(
         "curl",
-        ["-sL", "--fail", "-o", destPath, sourceUrl],
+        [
+          "-sL",
+          "--fail",
+          "-A",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+          "-o", destPath,
+          sourceUrl,
+        ],
         { timeout: 0, maxBuffer: 10 * 1024 * 1024 }
       );
       const stats = fs.statSync(destPath);
